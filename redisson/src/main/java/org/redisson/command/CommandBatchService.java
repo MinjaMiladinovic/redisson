@@ -1,467 +1,671 @@
+package org.apache.zookeeper.server;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import org.apache.commons.lang.StringUtils;
+import org.apache.jute.Record;
+import org.apache.zookeeper.ClientCnxn;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.KeeperException.Code;
+import org.apache.zookeeper.KeeperException.SessionMovedException;
+import org.apache.zookeeper.MultiOperationRecord;
+import org.apache.zookeeper.MultiResponse;
+import org.apache.zookeeper.Op;
+import org.apache.zookeeper.OpResult;
+import org.apache.zookeeper.OpResult.CheckResult;
+import org.apache.zookeeper.OpResult.CreateResult;
+import org.apache.zookeeper.OpResult.DeleteResult;
+import org.apache.zookeeper.OpResult.ErrorResult;
+import org.apache.zookeeper.OpResult.GetChildrenResult;
+import org.apache.zookeeper.OpResult.GetDataResult;
+import org.apache.zookeeper.OpResult.SetDataResult;
+import org.apache.zookeeper.Watcher.WatcherType;
+import org.apache.zookeeper.ZooDefs;
+import org.apache.zookeeper.ZooDefs.OpCode;
+import org.apache.zookeeper.audit.AuditHelper;
+import org.apache.zookeeper.common.Time;
+import org.apache.zookeeper.data.ACL;
+import org.apache.zookeeper.data.Id;
+import org.apache.zookeeper.data.Stat;
+import org.apache.zookeeper.proto.AddWatchRequest;
+import org.apache.zookeeper.proto.CheckWatchesRequest;
+import org.apache.zookeeper.proto.Create2Response;
+import org.apache.zookeeper.proto.CreateResponse;
+import org.apache.zookeeper.proto.ErrorResponse;
+import org.apache.zookeeper.proto.ExistsRequest;
+import org.apache.zookeeper.proto.ExistsResponse;
+import org.apache.zookeeper.proto.GetACLRequest;
+import org.apache.zookeeper.proto.GetACLResponse;
+import org.apache.zookeeper.proto.GetAllChildrenNumberRequest;
+import org.apache.zookeeper.proto.GetAllChildrenNumberResponse;
+import org.apache.zookeeper.proto.GetChildren2Request;
+import org.apache.zookeeper.proto.GetChildren2Response;
+import org.apache.zookeeper.proto.GetChildrenRequest;
+import org.apache.zookeeper.proto.GetChildrenResponse;
+import org.apache.zookeeper.proto.GetDataRequest;
+import org.apache.zookeeper.proto.GetDataResponse;
+import org.apache.zookeeper.proto.GetEphemeralsRequest;
+import org.apache.zookeeper.proto.GetEphemeralsResponse;
+import org.apache.zookeeper.proto.RemoveWatchesRequest;
+import org.apache.zookeeper.proto.ReplyHeader;
+import org.apache.zookeeper.proto.SetACLResponse;
+import org.apache.zookeeper.proto.SetDataResponse;
+import org.apache.zookeeper.proto.SetWatches;
+import org.apache.zookeeper.proto.SetWatches2;
+import org.apache.zookeeper.proto.SyncRequest;
+import org.apache.zookeeper.proto.SyncResponse;
+import org.apache.zookeeper.server.DataTree.ProcessTxnResult;
+import org.apache.zookeeper.server.quorum.QuorumZooKeeperServer;
+import org.apache.zookeeper.server.util.RequestPathMetricsCollector;
+import org.apache.zookeeper.txn.ErrorTxn;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
- * Copyright (c) 2013-2020 Nikita Koksharov
+ * This Request processor actually applies any transaction associated with a
+ * request and services any queries. It is always at the end of a
+ * RequestProcessor chain (hence the name), so it does not have a nextProcessor
+ * member.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * This RequestProcessor counts on ZooKeeperServer to populate the
+ * outstandingRequests member of ZooKeeperServer.
  */
-package org.redisson.command;
+public class FinalRequestProcessor implements RequestProcessor {
 
-import io.netty.util.Timeout;
-import io.netty.util.TimerTask;
-import org.redisson.api.BatchOptions;
-import org.redisson.api.BatchOptions.ExecutionMode;
-import org.redisson.api.BatchResult;
-import org.redisson.api.RFuture;
-import org.redisson.client.RedisConnection;
-import org.redisson.client.RedisTimeoutException;
-import org.redisson.client.codec.Codec;
-import org.redisson.client.protocol.BatchCommandData;
-import org.redisson.client.protocol.CommandData;
-import org.redisson.client.protocol.RedisCommand;
-import org.redisson.client.protocol.RedisCommands;
-import org.redisson.connection.ConnectionManager;
-import org.redisson.connection.MasterSlaveEntry;
-import org.redisson.connection.NodeSource;
-import org.redisson.liveobject.core.RedissonObjectBuilder;
-import org.redisson.misc.CountableListener;
-import org.redisson.misc.RPromise;
-import org.redisson.misc.RedissonPromise;
-import org.redisson.pubsub.AsyncSemaphore;
+    private static final Logger LOG = LoggerFactory.getLogger(FinalRequestProcessor.class);
 
-import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
+    private final RequestPathMetricsCollector requestPathMetricsCollector;
 
-/**
- * 
- * @author Nikita Koksharov
- *
- */
-public class CommandBatchService extends CommandAsyncService {
+    ZooKeeperServer zks;
 
-    public static class ConnectionEntry {
-
-        boolean firstCommand = true;
-        RFuture<RedisConnection> connectionFuture;
-        
-        public RFuture<RedisConnection> getConnectionFuture() {
-            return connectionFuture;
-        }
-        
-        public void setConnectionFuture(RFuture<RedisConnection> connectionFuture) {
-            this.connectionFuture = connectionFuture;
-        }
-
-        public boolean isFirstCommand() {
-            return firstCommand;
-        }
-
-        public void setFirstCommand(boolean firstCommand) {
-            this.firstCommand = firstCommand;
-        }
-        
+    public FinalRequestProcessor(ZooKeeperServer zks) {
+        this.zks = zks;
+        this.requestPathMetricsCollector = zks.getRequestPathMetricsCollector();
     }
-    
-    public static class Entry {
 
-        Deque<BatchCommandData<?, ?>> commands = new LinkedBlockingDeque<>();
-        volatile boolean readOnlyMode = true;
+    private ProcessTxnResult applyRequest(Request request) {
+        ProcessTxnResult rc = zks.processTxn(request);
 
-        public Deque<BatchCommandData<?, ?>> getCommands() {
-            return commands;
-        }
-
-        public void setReadOnlyMode(boolean readOnlyMode) {
-            this.readOnlyMode = readOnlyMode;
-        }
-
-        public boolean isReadOnlyMode() {
-            return readOnlyMode;
-        }
-        
-
-        public void clearErrors() {
-            for (BatchCommandData<?, ?> commandEntry : commands) {
-                commandEntry.clearError();
+        // ZOOKEEPER-558:
+        // In some cases the server does not close the connection (e.g., closeconn buffer
+        // was not being queued — ZOOKEEPER-558) properly. This happens, for example,
+        // when the client closes the connection. The server should still close the session, though.
+        // Calling closeSession() after losing the cnxn, results in the client close session response being dropped.
+        if (request.type == OpCode.closeSession && connClosedByClient(request)) {
+            // We need to check if we can close the session id.
+            // Sometimes the corresponding ServerCnxnFactory could be null because
+            // we are just playing diffs from the leader.
+            if (closeSession(zks.serverCnxnFactory, request.sessionId)
+                || closeSession(zks.secureServerCnxnFactory, request.sessionId)) {
+                return rc;
             }
         }
 
-    }
-
-    private AsyncSemaphore semaphore = new AsyncSemaphore(0);
-    private AtomicInteger index = new AtomicInteger();
-
-    private ConcurrentMap<MasterSlaveEntry, Entry> commands = new ConcurrentHashMap<>();
-    private ConcurrentMap<MasterSlaveEntry, ConnectionEntry> connections = new ConcurrentHashMap<>();
-    
-    private BatchOptions options = BatchOptions.defaults();
-    
-    private Map<RFuture<?>, List<CommandBatchService>> nestedServices = new ConcurrentHashMap<>();
-
-    private AtomicBoolean executed = new AtomicBoolean();
-
-    public CommandBatchService(ConnectionManager connectionManager) {
-        super(connectionManager);
-    }
-    
-    public CommandBatchService(ConnectionManager connectionManager, BatchOptions options) {
-        super(connectionManager);
-        this.options = options;
-    }
-
-    public void setObjectBuilder(RedissonObjectBuilder objectBuilder) {
-        this.objectBuilder = objectBuilder;
-    }
-    
-    public BatchOptions getOptions() {
-        return options;
-    }
-
-    public void add(RFuture<?> future, List<CommandBatchService> services) {
-        nestedServices.put(future, services);
-    }
-    
-    @Override
-    public <V, R> void async(boolean readOnlyMode, NodeSource nodeSource,
-            Codec codec, RedisCommand<V> command, Object[] params, RPromise<R> mainPromise, boolean ignoreRedirect) {
-        if (isRedisBasedQueue()) {
-            boolean isReadOnly = options.getExecutionMode() == ExecutionMode.REDIS_READ_ATOMIC;
-            RedisExecutor<V, R> executor = new RedisQueuedBatchExecutor<>(isReadOnly, nodeSource, codec, command, params, mainPromise,
-                    true, connectionManager, objectBuilder, commands, connections, options, index, executed, semaphore);
-            executor.execute();
-        } else {
-            RedisExecutor<V, R> executor = new RedisBatchExecutor<>(readOnlyMode, nodeSource, codec, command, params, mainPromise, 
-                    true, connectionManager, objectBuilder, commands, options, index, executed);
-            executor.execute();
-        }
-        
-    }
-        
-    @Override
-    public <R> RPromise<R> createPromise() {
-        if (isRedisBasedQueue()) {
-            return new BatchPromise<>(executed);
-        }
-        
-        return new RedissonPromise<>();
-    }
-    
-    public BatchResult<?> execute() {
-        RFuture<BatchResult<?>> f = executeAsync();
-        return get(f);
-    }
-
-    public RFuture<Void> executeAsyncVoid() {
-        RedissonPromise<Void> promise = new RedissonPromise<Void>();
-        RFuture<BatchResult<?>> resFuture = executeAsync();
-        resFuture.onComplete((res, e) -> {
-            if (e == null) {
-                promise.trySuccess(null);
-            } else {
-                promise.tryFailure(e);
-            }
-        });
-        return promise;
-    }
-
-    public boolean isExecuted() {
-        return executed.get();
-    }
-
-    public RFuture<BatchResult<?>> executeAsync() {
-        if (executed.get()) {
-            throw new IllegalStateException("Batch already executed!");
-        }
-        
-        if (commands.isEmpty()) {
-            executed.set(true);
-            BatchResult<Object> result = new BatchResult<>(Collections.emptyList(), 0);
-            return RedissonPromise.newSucceededFuture(result);
-        }
-
-        if (isRedisBasedQueue()) {
-            return executeRedisBasedQueue();
-        }
-
-        if (this.options.getExecutionMode() != ExecutionMode.IN_MEMORY) {
-            for (Entry entry : commands.values()) {
-                BatchCommandData<?, ?> multiCommand = new BatchCommandData(RedisCommands.MULTI, new Object[] {}, index.incrementAndGet());
-                entry.getCommands().addFirst(multiCommand);
-                BatchCommandData<?, ?> execCommand = new BatchCommandData(RedisCommands.EXEC, new Object[] {}, index.incrementAndGet());
-                entry.getCommands().add(execCommand);
+        if (request.getHdr() != null) {
+            /*
+             * Request header is created only by the leader, so this must be
+             * a quorum request. Since we're comparing timestamps across hosts,
+             * this metric may be incorrect. However, it's still a very useful
+             * metric to track in the happy case. If there is clock drift,
+             * the latency can go negative. Note: headers use wall time, not
+             * CLOCK_MONOTONIC.
+             */
+            long propagationLatency = Time.currentWallTime() - request.getHdr().getTime();
+            if (propagationLatency >= 0) {
+                ServerMetrics.getMetrics().PROPAGATION_LATENCY.add(propagationLatency);
             }
         }
-        
-        if (this.options.isSkipResult()) {
-            for (Entry entry : commands.values()) {
-                BatchCommandData<?, ?> offCommand = new BatchCommandData(RedisCommands.CLIENT_REPLY, new Object[] { "OFF" }, index.incrementAndGet());
-                entry.getCommands().addFirst(offCommand);
-                BatchCommandData<?, ?> onCommand = new BatchCommandData(RedisCommands.CLIENT_REPLY, new Object[] { "ON" }, index.incrementAndGet());
-                entry.getCommands().add(onCommand);
-            }
-        }
-        
-        if (this.options.getSyncSlaves() > 0) {
-            for (Entry entry : commands.values()) {
-                BatchCommandData<?, ?> waitCommand = new BatchCommandData(RedisCommands.WAIT, 
-                                    new Object[] { this.options.getSyncSlaves(), this.options.getSyncTimeout() }, index.incrementAndGet());
-                entry.getCommands().add(waitCommand);
-            }
-        }
-        
-        RPromise<BatchResult<?>> promise = new RedissonPromise<>();
-        RPromise<Void> voidPromise = new RedissonPromise<Void>();
-        if (this.options.isSkipResult()
-                && this.options.getSyncSlaves() == 0) {
-            voidPromise.onComplete((res, e) -> {
-                executed.set(true);
-                commands.clear();
-                nestedServices.clear();
-                promise.trySuccess(new BatchResult<>(Collections.emptyList(), 0));
-            });
-        } else {
-            voidPromise.onComplete((res, ex) -> {
-                executed.set(true);
-                if (ex != null) {
-                    promise.tryFailure(ex);
 
-                    for (Entry e : commands.values()) {
-                        e.getCommands().forEach(t -> t.tryFailure(ex));
+        return rc;
+    }
+
+    public void processRequest(Request request) {
+        LOG.debug("Processing request:: {}", request);
+
+        if (LOG.isTraceEnabled()) {
+            long traceMask = ZooTrace.CLIENT_REQUEST_TRACE_MASK;
+            if (request.type == OpCode.ping) {
+                traceMask = ZooTrace.SERVER_PING_TRACE_MASK;
+            }
+            ZooTrace.logRequest(LOG, traceMask, 'E', request, "");
+        }
+        ProcessTxnResult rc = null;
+        if (!request.isThrottled()) {
+          rc = applyRequest(request);
+        }
+        if (request.cnxn == null) {
+            return;
+        }
+        ServerCnxn cnxn = request.cnxn;
+
+        long lastZxid = zks.getZKDatabase().getDataTreeLastProcessedZxid();
+
+        String lastOp = "NA";
+        // Notify ZooKeeperServer that the request has finished so that it can
+        // update any request accounting/throttling limits
+        zks.decInProcess();
+        zks.requestFinished(request);
+        Code err = Code.OK;
+        Record rsp = null;
+        String path = null;
+        int responseSize = 0;
+        try {
+            if (request.getHdr() != null && request.getHdr().getType() == OpCode.error) {
+                AuditHelper.addAuditLog(request, rc, true);
+                /*
+                 * When local session upgrading is disabled, leader will
+                 * reject the ephemeral node creation due to session expire.
+                 * However, if this is the follower that issue the request,
+                 * it will have the correct error code, so we should use that
+                 * and report to user
+                 */
+                if (request.getException() != null) {
+                    throw request.getException();
+                } else {
+                    throw KeeperException.create(KeeperException.Code.get(((ErrorTxn) request.getTxn()).getErr()));
+                }
+            }
+
+            KeeperException ke = request.getException();
+            if (ke instanceof SessionMovedException) {
+                throw ke;
+            }
+            if (ke != null && request.type != OpCode.multi) {
+                throw ke;
+            }
+
+            LOG.debug("{}", request);
+
+            if (request.isStale()) {
+                ServerMetrics.getMetrics().STALE_REPLIES.add(1);
+            }
+
+            if (request.isThrottled()) {
+              throw KeeperException.create(Code.THROTTLEDOP);
+            }
+
+            AuditHelper.addAuditLog(request, rc);
+
+            switch (request.type) {
+            case OpCode.ping: {
+                lastOp = "PING";
+                updateStats(request, lastOp, lastZxid);
+
+                responseSize = cnxn.sendResponse(new ReplyHeader(ClientCnxn.PING_XID, lastZxid, 0), null, "response");
+                return;
+            }
+            case OpCode.createSession: {
+                lastOp = "SESS";
+                updateStats(request, lastOp, lastZxid);
+
+                zks.finishSessionInit(request.cnxn, true);
+                return;
+            }
+            case OpCode.multi: {
+                lastOp = "MULT";
+                rsp = new MultiResponse();
+
+                for (ProcessTxnResult subTxnResult : rc.multiResult) {
+
+                    OpResult subResult;
+
+                    switch (subTxnResult.type) {
+                    case OpCode.check:
+                        subResult = new CheckResult();
+                        break;
+                    case OpCode.create:
+                        subResult = new CreateResult(subTxnResult.path);
+                        break;
+                    case OpCode.create2:
+                    case OpCode.createTTL:
+                    case OpCode.createContainer:
+                        subResult = new CreateResult(subTxnResult.path, subTxnResult.stat);
+                        break;
+                    case OpCode.delete:
+                    case OpCode.deleteContainer:
+                        subResult = new DeleteResult();
+                        break;
+                    case OpCode.setData:
+                        subResult = new SetDataResult(subTxnResult.stat);
+                        break;
+                    case OpCode.error:
+                        subResult = new ErrorResult(subTxnResult.err);
+                        if (subTxnResult.err == Code.SESSIONMOVED.intValue()) {
+                            throw new SessionMovedException();
+                        }
+                        break;
+                    default:
+                        throw new IOException("Invalid type of op");
                     }
 
-                    commands.clear();
-                    nestedServices.clear();
-                    return;
+                    ((MultiResponse) rsp).add(subResult);
                 }
-                
-                List<BatchCommandData> entries = new ArrayList<BatchCommandData>();
-                for (Entry e : commands.values()) {
-                    entries.addAll(e.getCommands());
-                }
-                Collections.sort(entries);
-                List<Object> responses = new ArrayList<Object>(entries.size());
-                int syncedSlaves = 0;
-                for (BatchCommandData<?, ?> commandEntry : entries) {
-                    if (isWaitCommand(commandEntry)) {
-                        syncedSlaves = (Integer) commandEntry.getPromise().getNow();
-                    } else if (!commandEntry.getCommand().getName().equals(RedisCommands.MULTI.getName())
-                            && !commandEntry.getCommand().getName().equals(RedisCommands.EXEC.getName())
-                            && !this.options.isSkipResult()) {
-                        
-                        if (commandEntry.getPromise().isCancelled()) {
-                            continue;
-                        }
-                        
-                        Object entryResult = commandEntry.getPromise().getNow();
-                        try {
-                            entryResult = RedisExecutor.tryHandleReference(objectBuilder, entryResult);
-                        } catch (ReflectiveOperationException exc) {
-                            log.error("Unable to handle reference from " + entryResult, exc);
-                        }
-                        responses.add(entryResult);
-                    }
-                }
-                
-                BatchResult<Object> result = new BatchResult<Object>(responses, syncedSlaves);
-                promise.trySuccess(result);
 
-                commands.clear();
-                nestedServices.clear();
-            });
-        }
-
-        AtomicInteger slots = new AtomicInteger(commands.size());
-
-        for (Map.Entry<RFuture<?>, List<CommandBatchService>> entry : nestedServices.entrySet()) {
-            slots.incrementAndGet();
-            for (CommandBatchService service : entry.getValue()) {
-                service.executeAsync();
+                break;
             }
-            
-            entry.getKey().onComplete((res, e) -> {
-                handle(voidPromise, slots, entry.getKey());
-            });
-        }
-        
-        for (Map.Entry<MasterSlaveEntry, Entry> e : commands.entrySet()) {
-            RedisCommonBatchExecutor executor = new RedisCommonBatchExecutor(new NodeSource(e.getKey()), voidPromise,
-                                                    connectionManager, this.options, e.getValue(), slots);
-            executor.execute();
-        }
-        return promise;
-    }
-
-    private <R> RFuture<R> executeRedisBasedQueue() {
-        int permits = 0;
-        for (Entry entry : commands.values()) {
-            permits += entry.getCommands().size();
-        }
-        
-        RPromise<R> resultPromise = new RedissonPromise<R>();
-        Timeout timeout;
-        if (semaphore.getCounter() < permits) {
-            long responseTimeout;
-            if (options.getResponseTimeout() > 0) {
-                responseTimeout = options.getResponseTimeout();
-            } else {
-                responseTimeout = connectionManager.getConfig().getTimeout();
-            }
-
-            timeout = connectionManager.newTimeout(new TimerTask() {
-                @Override
-                public void run(Timeout timeout) throws Exception {
-                    resultPromise.tryFailure(new RedisTimeoutException("Response timeout for queued commands " + responseTimeout + ": " +
-                            commands.values().stream()
-                                    .flatMap(e -> e.getCommands().stream().map(d -> d.getCommand()))
-                                    .collect(Collectors.toList())));
-                }
-            }, responseTimeout, TimeUnit.MILLISECONDS);
-        } else {
-            timeout = null;
-        }
-
-        semaphore.acquire(new Runnable() {
-            @Override
-            public void run() {
-                if (timeout != null) {
-                    timeout.cancel();
-                }
-
-                for (Entry entry : commands.values()) {
-                    for (BatchCommandData<?, ?> command : entry.getCommands()) {
-                        if (command.getPromise().isDone() && !command.getPromise().isSuccess()) {
-                            resultPromise.tryFailure(command.getPromise().cause());
-                            break;
-                        }
-                    }
-                }
-                
-                if (resultPromise.isDone()) {
-                    return;
-                }
-                
-                RPromise<Map<MasterSlaveEntry, List<Object>>> mainPromise = new RedissonPromise<>();
-                Map<MasterSlaveEntry, List<Object>> result = new ConcurrentHashMap<>();
-                CountableListener<Map<MasterSlaveEntry, List<Object>>> listener = new CountableListener<>(mainPromise, result);
-                listener.setCounter(connections.size());
-                for (Map.Entry<MasterSlaveEntry, Entry> entry : commands.entrySet()) {
-                    RPromise<List<Object>> execPromise = new RedissonPromise<>();
-                    async(entry.getValue().isReadOnlyMode(), new NodeSource(entry.getKey()), connectionManager.getCodec(), RedisCommands.EXEC, 
-                            new Object[] {}, execPromise, false);
-                    execPromise.onComplete((r, ex) -> {
-                        if (ex != null) {
-                            mainPromise.tryFailure(ex);
-                            return;
-                        }
-
-                        BatchCommandData<?, Integer> lastCommand = (BatchCommandData<?, Integer>) entry.getValue().getCommands().peekLast();
-                        result.put(entry.getKey(), r);
-                        if (RedisCommands.WAIT.getName().equals(lastCommand.getCommand().getName())) {
-                            lastCommand.getPromise().onComplete((res, e) -> {
-                                if (e != null) {
-                                    mainPromise.tryFailure(e);
-                                    return;
-                                }
-                                
-                                execPromise.onComplete(listener);
-                            });
-                        } else {
-                            execPromise.onComplete(listener);
-                        }
-                    });
-                }
-                
-                mainPromise.onComplete((res, ex) -> {
-                    executed.set(true);
-                    if (ex != null) {
-                        resultPromise.tryFailure(ex);
-                        return;
-                    }
-                    
+            case OpCode.multiRead: {
+                lastOp = "MLTR";
+                MultiOperationRecord multiReadRecord = new MultiOperationRecord();
+                ByteBufferInputStream.byteBuffer2Record(request.request, multiReadRecord);
+                rsp = new MultiResponse();
+                OpResult subResult;
+                for (Op readOp : multiReadRecord) {
                     try {
-                        for (java.util.Map.Entry<MasterSlaveEntry, List<Object>> entry : res.entrySet()) {
-                            Entry commandEntry = commands.get(entry.getKey());
-                            Iterator<Object> resultIter = entry.getValue().iterator();
-                            for (BatchCommandData<?, ?> data : commandEntry.getCommands()) {
-                                if (data.getCommand().getName().equals(RedisCommands.EXEC.getName())) {
-                                    break;
-                                }
-                                
-                                RPromise<Object> promise = (RPromise<Object>) data.getPromise();
-                                if (resultIter.hasNext()) {
-                                    promise.trySuccess(resultIter.next());
-                                } else {
-                                    // fix for https://github.com/redisson/redisson/issues/2212
-                                    promise.trySuccess(null);
-                                }
-                            }
+                        Record rec;
+                        switch (readOp.getType()) {
+                        case OpCode.getChildren:
+                            rec = handleGetChildrenRequest(readOp.toRequestRecord(), cnxn, request.authInfo);
+                            subResult = new GetChildrenResult(((GetChildrenResponse) rec).getChildren());
+                            break;
+                        case OpCode.getData:
+                            rec = handleGetDataRequest(readOp.toRequestRecord(), cnxn, request.authInfo);
+                            GetDataResponse gdr = (GetDataResponse) rec;
+                            subResult = new GetDataResult(gdr.getData(), gdr.getStat());
+                            break;
+                        default:
+                            throw new IOException("Invalid type of readOp");
                         }
-                        
-                        List<BatchCommandData> entries = new ArrayList<BatchCommandData>();
-                        for (Entry e : commands.values()) {
-                            entries.addAll(e.getCommands());
-                        }
-                        Collections.sort(entries);
-                        List<Object> responses = new ArrayList<Object>(entries.size());
-                        int syncedSlaves = 0;
-                        for (BatchCommandData<?, ?> commandEntry : entries) {
-                            if (isWaitCommand(commandEntry)) {
-                                syncedSlaves += (Integer) commandEntry.getPromise().getNow();
-                            } else if (!commandEntry.getCommand().getName().equals(RedisCommands.MULTI.getName())
-                                    && !commandEntry.getCommand().getName().equals(RedisCommands.EXEC.getName())) {
-                                Object entryResult = commandEntry.getPromise().getNow();
-                                entryResult = RedisExecutor.tryHandleReference(objectBuilder, entryResult);
-                                responses.add(entryResult);
-                            }
-                        }
-                        BatchResult<Object> r = new BatchResult<Object>(responses, syncedSlaves);
-                        resultPromise.trySuccess((R) r);
-                    } catch (Exception e) {
-                        resultPromise.tryFailure(e);
+                    } catch (KeeperException e) {
+                        subResult = new ErrorResult(e.code().intValue());
                     }
-                });
+                    ((MultiResponse) rsp).add(subResult);
+                }
+                break;
             }
-        }, permits);
-        return resultPromise;
-    }
-
-    protected boolean isRedisBasedQueue() {
-        return options != null && (options.getExecutionMode() == ExecutionMode.REDIS_READ_ATOMIC 
-                                    || options.getExecutionMode() == ExecutionMode.REDIS_WRITE_ATOMIC);
-    }
-
-    protected boolean isWaitCommand(CommandData<?, ?> c) {
-        return c.getCommand().getName().equals(RedisCommands.WAIT.getName());
-    }
-
-    protected void handle(RPromise<Void> mainPromise, AtomicInteger slots, RFuture<?> future) {
-        if (future.isSuccess()) {
-            if (slots.decrementAndGet() == 0) {
-                mainPromise.trySuccess(null);
+            case OpCode.create: {
+                lastOp = "CREA";
+                rsp = new CreateResponse(rc.path);
+                err = Code.get(rc.err);
+                requestPathMetricsCollector.registerRequest(request.type, rc.path);
+                break;
             }
-        } else {
-            mainPromise.tryFailure(future.cause());
+            case OpCode.create2:
+            case OpCode.createTTL:
+            case OpCode.createContainer: {
+                lastOp = "CREA";
+                rsp = new Create2Response(rc.path, rc.stat);
+                err = Code.get(rc.err);
+                requestPathMetricsCollector.registerRequest(request.type, rc.path);
+                break;
+            }
+            case OpCode.delete:
+            case OpCode.deleteContainer: {
+                lastOp = "DELE";
+                err = Code.get(rc.err);
+                requestPathMetricsCollector.registerRequest(request.type, rc.path);
+                break;
+            }
+            case OpCode.setData: {
+                lastOp = "SETD";
+                rsp = new SetDataResponse(rc.stat);
+                err = Code.get(rc.err);
+                requestPathMetricsCollector.registerRequest(request.type, rc.path);
+                break;
+            }
+            case OpCode.reconfig: {
+                lastOp = "RECO";
+                rsp = new GetDataResponse(
+                    ((QuorumZooKeeperServer) zks).self.getQuorumVerifier().toString().getBytes(),
+                    rc.stat);
+                err = Code.get(rc.err);
+                break;
+            }
+            case OpCode.setACL: {
+                lastOp = "SETA";
+                rsp = new SetACLResponse(rc.stat);
+                err = Code.get(rc.err);
+                requestPathMetricsCollector.registerRequest(request.type, rc.path);
+                break;
+            }
+            case OpCode.closeSession: {
+                lastOp = "CLOS";
+                err = Code.get(rc.err);
+                break;
+            }
+            case OpCode.sync: {
+                lastOp = "SYNC";
+                SyncRequest syncRequest = new SyncRequest();
+                ByteBufferInputStream.byteBuffer2Record(request.request, syncRequest);
+                rsp = new SyncResponse(syncRequest.getPath());
+                requestPathMetricsCollector.registerRequest(request.type, syncRequest.getPath());
+                break;
+            }
+            case OpCode.check: {
+                lastOp = "CHEC";
+                rsp = new SetDataResponse(rc.stat);
+                err = Code.get(rc.err);
+                break;
+            }
+            case OpCode.exists: {
+                lastOp = "EXIS";
+                // TODO we need to figure out the security requirement for this!
+                ExistsRequest existsRequest = new ExistsRequest();
+                ByteBufferInputStream.byteBuffer2Record(request.request, existsRequest);
+                path = existsRequest.getPath();
+                if (path.indexOf('\0') != -1) {
+                    throw new KeeperException.BadArgumentsException();
+                }
+                Stat stat = zks.getZKDatabase().statNode(path, existsRequest.getWatch() ? cnxn : null);
+                rsp = new ExistsResponse(stat);
+                requestPathMetricsCollector.registerRequest(request.type, path);
+                break;
+            }
+            case OpCode.getData: {
+                lastOp = "GETD";
+                GetDataRequest getDataRequest = new GetDataRequest();
+                ByteBufferInputStream.byteBuffer2Record(request.request, getDataRequest);
+                path = getDataRequest.getPath();
+                rsp = handleGetDataRequest(getDataRequest, cnxn, request.authInfo);
+                requestPathMetricsCollector.registerRequest(request.type, path);
+                break;
+            }
+            case OpCode.setWatches: {
+                lastOp = "SETW";
+                SetWatches setWatches = new SetWatches();
+                // TODO we really should not need this
+                request.request.rewind();
+                ByteBufferInputStream.byteBuffer2Record(request.request, setWatches);
+                long relativeZxid = setWatches.getRelativeZxid();
+                zks.getZKDatabase()
+                   .setWatches(
+                       relativeZxid,
+                       setWatches.getDataWatches(),
+                       setWatches.getExistWatches(),
+                       setWatches.getChildWatches(),
+                       Collections.emptyList(),
+                       Collections.emptyList(),
+                       cnxn);
+                break;
+            }
+            case OpCode.setWatches2: {
+                lastOp = "STW2";
+                SetWatches2 setWatches = new SetWatches2();
+                // TODO we really should not need this
+                request.request.rewind();
+                ByteBufferInputStream.byteBuffer2Record(request.request, setWatches);
+                long relativeZxid = setWatches.getRelativeZxid();
+                zks.getZKDatabase().setWatches(relativeZxid,
+                        setWatches.getDataWatches(),
+                        setWatches.getExistWatches(),
+                        setWatches.getChildWatches(),
+                        setWatches.getPersistentWatches(),
+                        setWatches.getPersistentRecursiveWatches(),
+                        cnxn);
+                break;
+            }
+            case OpCode.addWatch: {
+                lastOp = "ADDW";
+                AddWatchRequest addWatcherRequest = new AddWatchRequest();
+                ByteBufferInputStream.byteBuffer2Record(request.request,
+                        addWatcherRequest);
+                zks.getZKDatabase().addWatch(addWatcherRequest.getPath(), cnxn, addWatcherRequest.getMode());
+                rsp = new ErrorResponse(0);
+                break;
+            }
+            case OpCode.getACL: {
+                lastOp = "GETA";
+                GetACLRequest getACLRequest = new GetACLRequest();
+                ByteBufferInputStream.byteBuffer2Record(request.request, getACLRequest);
+                path = getACLRequest.getPath();
+                DataNode n = zks.getZKDatabase().getNode(path);
+                if (n == null) {
+                    throw new KeeperException.NoNodeException();
+                }
+                zks.checkACL(
+                    request.cnxn,
+                    zks.getZKDatabase().aclForNode(n),
+                    ZooDefs.Perms.READ | ZooDefs.Perms.ADMIN, request.authInfo, path,
+                    null);
+
+                Stat stat = new Stat();
+                List<ACL> acl = zks.getZKDatabase().getACL(path, stat);
+                requestPathMetricsCollector.registerRequest(request.type, getACLRequest.getPath());
+
+                try {
+                    zks.checkACL(
+                        request.cnxn,
+                        zks.getZKDatabase().aclForNode(n),
+                        ZooDefs.Perms.ADMIN,
+                        request.authInfo,
+                        path,
+                        null);
+                    rsp = new GetACLResponse(acl, stat);
+                } catch (KeeperException.NoAuthException e) {
+                    List<ACL> acl1 = new ArrayList<ACL>(acl.size());
+                    for (ACL a : acl) {
+                        if ("digest".equals(a.getId().getScheme())) {
+                            Id id = a.getId();
+                            Id id1 = new Id(id.getScheme(), id.getId().replaceAll(":.*", ":x"));
+                            acl1.add(new ACL(a.getPerms(), id1));
+                        } else {
+                            acl1.add(a);
+                        }
+                    }
+                    rsp = new GetACLResponse(acl1, stat);
+                }
+                break;
+            }
+            case OpCode.getChildren: {
+                lastOp = "GETC";
+                GetChildrenRequest getChildrenRequest = new GetChildrenRequest();
+                ByteBufferInputStream.byteBuffer2Record(request.request, getChildrenRequest);
+                path = getChildrenRequest.getPath();
+                rsp = handleGetChildrenRequest(getChildrenRequest, cnxn, request.authInfo);
+                requestPathMetricsCollector.registerRequest(request.type, path);
+                break;
+            }
+            case OpCode.getAllChildrenNumber: {
+                lastOp = "GETACN";
+                GetAllChildrenNumberRequest getAllChildrenNumberRequest = new GetAllChildrenNumberRequest();
+                ByteBufferInputStream.byteBuffer2Record(request.request, getAllChildrenNumberRequest);
+                path = getAllChildrenNumberRequest.getPath();
+                DataNode n = zks.getZKDatabase().getNode(path);
+                if (n == null) {
+                    throw new KeeperException.NoNodeException();
+                }
+                zks.checkACL(
+                    request.cnxn,
+                    zks.getZKDatabase().aclForNode(n),
+                    ZooDefs.Perms.READ,
+                    request.authInfo,
+                    path,
+                    null);
+                int number = zks.getZKDatabase().getAllChildrenNumber(path);
+                rsp = new GetAllChildrenNumberResponse(number);
+                break;
+            }
+            case OpCode.getChildren2: {
+                lastOp = "GETC";
+                GetChildren2Request getChildren2Request = new GetChildren2Request();
+                ByteBufferInputStream.byteBuffer2Record(request.request, getChildren2Request);
+                Stat stat = new Stat();
+                path = getChildren2Request.getPath();
+                DataNode n = zks.getZKDatabase().getNode(path);
+                if (n == null) {
+                    throw new KeeperException.NoNodeException();
+                }
+                zks.checkACL(
+                    request.cnxn,
+                    zks.getZKDatabase().aclForNode(n),
+                    ZooDefs.Perms.READ,
+                    request.authInfo, path,
+                    null);
+                List<String> children = zks.getZKDatabase()
+                                           .getChildren(path, stat, getChildren2Request.getWatch() ? cnxn : null);
+                rsp = new GetChildren2Response(children, stat);
+                requestPathMetricsCollector.registerRequest(request.type, path);
+                break;
+            }
+            case OpCode.checkWatches: {
+                lastOp = "CHKW";
+                CheckWatchesRequest checkWatches = new CheckWatchesRequest();
+                ByteBufferInputStream.byteBuffer2Record(request.request, checkWatches);
+                WatcherType type = WatcherType.fromInt(checkWatches.getType());
+                path = checkWatches.getPath();
+                boolean containsWatcher = zks.getZKDatabase().containsWatcher(path, type, cnxn);
+                if (!containsWatcher) {
+                    String msg = String.format(Locale.ENGLISH, "%s (type: %s)", path, type);
+                    throw new KeeperException.NoWatcherException(msg);
+                }
+                requestPathMetricsCollector.registerRequest(request.type, checkWatches.getPath());
+                break;
+            }
+            case OpCode.removeWatches: {
+                lastOp = "REMW";
+                RemoveWatchesRequest removeWatches = new RemoveWatchesRequest();
+                ByteBufferInputStream.byteBuffer2Record(request.request, removeWatches);
+                WatcherType type = WatcherType.fromInt(removeWatches.getType());
+                path = removeWatches.getPath();
+                boolean removed = zks.getZKDatabase().removeWatch(path, type, cnxn);
+                if (!removed) {
+                    String msg = String.format(Locale.ENGLISH, "%s (type: %s)", path, type);
+                    throw new KeeperException.NoWatcherException(msg);
+                }
+                requestPathMetricsCollector.registerRequest(request.type, removeWatches.getPath());
+                break;
+            }
+            case OpCode.getEphemerals: {
+                lastOp = "GETE";
+                GetEphemeralsRequest getEphemerals = new GetEphemeralsRequest();
+                ByteBufferInputStream.byteBuffer2Record(request.request, getEphemerals);
+                String prefixPath = getEphemerals.getPrefixPath();
+                Set<String> allEphems = zks.getZKDatabase().getDataTree().getEphemerals(request.sessionId);
+                List<String> ephemerals = new ArrayList<>();
+                if (StringUtils.isBlank(prefixPath) || "/".equals(prefixPath.trim())) {
+                    ephemerals.addAll(allEphems);
+                } else {
+                    for (String p : allEphems) {
+                        if (p.startsWith(prefixPath)) {
+                            ephemerals.add(p);
+                        }
+                    }
+                }
+                rsp = new GetEphemeralsResponse(ephemerals);
+                break;
+            }
+            }
+        } catch (SessionMovedException e) {
+            // session moved is a connection level error, we need to tear
+            // down the connection otw ZOOKEEPER-710 might happen
+            // ie client on slow follower starts to renew session, fails
+            // before this completes, then tries the fast follower (leader)
+            // and is successful, however the initial renew is then
+            // successfully fwd/processed by the leader and as a result
+            // the client and leader disagree on where the client is most
+            // recently attached (and therefore invalid SESSION MOVED generated)
+            cnxn.sendCloseSession();
+            return;
+        } catch (KeeperException e) {
+            err = e.code();
+        } catch (Exception e) {
+            // log at error level as we are returning a marshalling
+            // error to the user
+            LOG.error("Failed to process {}", request, e);
+            StringBuilder sb = new StringBuilder();
+            ByteBuffer bb = request.request;
+            bb.rewind();
+            while (bb.hasRemaining()) {
+                sb.append(Integer.toHexString(bb.get() & 0xff));
+            }
+            LOG.error("Dumping request buffer: 0x{}", sb.toString());
+            err = Code.MARSHALLINGERROR;
+        }
+
+        ReplyHeader hdr = new ReplyHeader(request.cxid, lastZxid, err.intValue());
+
+        updateStats(request, lastOp, lastZxid);
+
+        try {
+            if (path == null || rsp == null) {
+                responseSize = cnxn.sendResponse(hdr, rsp, "response");
+            } else {
+                int opCode = request.type;
+                Stat stat = null;
+                // Serialized read and get children responses could be cached by the connection
+                // object. Cache entries are identified by their path and last modified zxid,
+                // so these values are passed along with the response.
+                switch (opCode) {
+                    case OpCode.getData : {
+                        GetDataResponse getDataResponse = (GetDataResponse) rsp;
+                        stat = getDataResponse.getStat();
+                        responseSize = cnxn.sendResponse(hdr, rsp, "response", path, stat, opCode);
+                        break;
+                    }
+                    case OpCode.getChildren2 : {
+                        GetChildren2Response getChildren2Response = (GetChildren2Response) rsp;
+                        stat = getChildren2Response.getStat();
+                        responseSize = cnxn.sendResponse(hdr, rsp, "response", path, stat, opCode);
+                        break;
+                    }
+                    default:
+                        responseSize = cnxn.sendResponse(hdr, rsp, "response");
+                }
+            }
+
+            if (request.type == OpCode.closeSession) {
+                cnxn.sendCloseSession();
+            }
+        } catch (IOException e) {
+            LOG.error("FIXMSG", e);
+        } finally {
+            ServerMetrics.getMetrics().RESPONSE_BYTES.add(responseSize);
         }
     }
-    
-    @Override
-    protected boolean isEvalCacheActive() {
-        return false;
+
+    private Record handleGetChildrenRequest(Record request, ServerCnxn cnxn, List<Id> authInfo) throws KeeperException, IOException {
+        GetChildrenRequest getChildrenRequest = (GetChildrenRequest) request;
+        String path = getChildrenRequest.getPath();
+        DataNode n = zks.getZKDatabase().getNode(path);
+        if (n == null) {
+            throw new KeeperException.NoNodeException();
+        }
+        zks.checkACL(cnxn, zks.getZKDatabase().aclForNode(n), ZooDefs.Perms.READ, authInfo, path, null);
+        List<String> children = zks.getZKDatabase()
+                                   .getChildren(path, null, getChildrenRequest.getWatch() ? cnxn : null);
+        return new GetChildrenResponse(children);
     }
-    
+
+    private Record handleGetDataRequest(Record request, ServerCnxn cnxn, List<Id> authInfo) throws KeeperException, IOException {
+        GetDataRequest getDataRequest = (GetDataRequest) request;
+        String path = getDataRequest.getPath();
+        DataNode n = zks.getZKDatabase().getNode(path);
+        if (n == null) {
+            throw new KeeperException.NoNodeException();
+        }
+        zks.checkACL(cnxn, zks.getZKDatabase().aclForNode(n), ZooDefs.Perms.READ, authInfo, path, null);
+        Stat stat = new Stat();
+        byte[] b = zks.getZKDatabase().getData(path, stat, getDataRequest.getWatch() ? cnxn : null);
+        return new GetDataResponse(b, stat);
+    }
+
+    private boolean closeSession(ServerCnxnFactory serverCnxnFactory, long sessionId) {
+        if (serverCnxnFactory == null) {
+            return false;
+        }
+        return serverCnxnFactory.closeSession(sessionId, ServerCnxn.DisconnectReason.CLIENT_CLOSED_SESSION);
+    }
+
+    private boolean connClosedByClient(Request request) {
+        return request.cnxn == null;
+    }
+
+    public void shutdown() {
+        // we are the final link in the chain
+        LOG.info("shutdown of request processor complete");
+    }
+
+    private void updateStats(Request request, String lastOp, long lastZxid) {
+        if (request.cnxn == null) {
+            return;
+        }
+        long currentTime = Time.currentElapsedTime();
+        zks.serverStats().updateLatency(request, currentTime);
+        request.cnxn.updateStatsForResponse(request.cxid, lastZxid, lastOp, request.createTime, currentTime);
+    }
 
 }
